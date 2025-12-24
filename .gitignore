@@ -1,6 +1,7 @@
 *.o
 .deps
 *.so
+*.dylib
 .cproject
 .settings
 .project

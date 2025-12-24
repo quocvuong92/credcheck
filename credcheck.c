@@ -186,6 +186,34 @@ typedef struct pgafSharedState
 static pgafSharedState *pgaf = NULL;
 static HTAB *pgaf_hash = NULL;
 
+/*
+ * PgBouncer support: pending auth tracking
+ * Used to detect auth failures that occur at PgBouncer layer
+ */
+#define PGPA_TRANCHE_NAME  "credcheck_pending_auth"
+#define PGPA_MAX           1024
+#define PENDING_AUTH_TIMEOUT_SECS  5
+
+typedef struct pgpaHashKey
+{
+	Oid  roleid;
+} pgpaHashKey;
+
+typedef struct pgpaEntry
+{
+	pgpaHashKey key;              /* hash key - MUST BE FIRST */
+	TimestampTz attempt_time;     /* when the auth attempt started */
+	char        username[NAMEDATALEN];  /* username for logging */
+} pgpaEntry;
+
+typedef struct pgpaSharedState
+{
+	LWLock     *lock;
+	int         num_entries;
+} pgpaSharedState;
+
+static pgpaSharedState *pgpa = NULL;
+static HTAB *pgpa_hash = NULL;
 
 /* Functions */
 extern void _PG_init(void);
@@ -215,6 +243,11 @@ static float save_auth_failure(Port *port, Oid userid);
 static void remove_auth_failure(const char *username, Oid userid);
 static void pg_banned_role_internal(FunctionCallInfo fcinfo);
 static void set_force_change_password(Oid databaseid, Oid roleid, char *valuestr);
+
+/* PgBouncer support functions */
+static void pgpa_shmem_startup(void);
+static Size pgpa_memsize(void);
+static pgpaEntry *pgpa_entry_alloc(pgpaHashKey *key, const char *username);
 
 /* Username flags*/
 static int username_min_length = 1;
@@ -1392,6 +1425,8 @@ _PG_init(void)
         RequestNamedLWLockTranche(PGPH_TRANCHE_NAME, 1);
         RequestAddinShmemSpace(pgaf_memsize());
         RequestNamedLWLockTranche(PGAF_TRANCHE_NAME, 1);
+        RequestAddinShmemSpace(pgpa_memsize());
+        RequestNamedLWLockTranche(PGPA_TRANCHE_NAME, 1);
 #else
 	MarkGUCPrefixReserved("credcheck");
 	MarkGUCPrefixReserved("credcheck_internal");
@@ -1847,6 +1882,8 @@ pghist_shmem_request(void)
 	RequestNamedLWLockTranche(PGPH_TRANCHE_NAME, 1);
 	RequestAddinShmemSpace(pgaf_memsize());
 	RequestNamedLWLockTranche(PGAF_TRANCHE_NAME, 1);
+	RequestAddinShmemSpace(pgpa_memsize());
+	RequestNamedLWLockTranche(PGPA_TRANCHE_NAME, 1);
 }
 #endif
 
@@ -1860,6 +1897,8 @@ pghist_shmem_startup(void)
 	pgph_shmem_startup();
 
 	pgaf_shmem_startup();
+
+	pgpa_shmem_startup();
 }
 
 /*
@@ -2808,5 +2847,309 @@ set_force_change_password(Oid databaseid, Oid roleid, char *valuestr)
 	if (need_priv_escalation)
 		SetUserIdAndSecContext(save_userid, save_sec_context);
 
+}
+
+/******************************************************************************
+ * PgBouncer Support: Pending Auth Tracking
+ *
+ * These functions allow tracking authentication failures that occur at the
+ * PgBouncer layer, where PostgreSQL's ClientAuthentication_hook cannot see them.
+ *
+ * How it works:
+ * 1. user_search() calls pg_auth_attempt_begin() - records pending auth
+ * 2. If auth succeeds, user connects and calls pg_auth_attempt_success()
+ * 3. If auth fails, the pending entry remains
+ * 4. On next login attempt, pg_auth_attempt_begin() detects the expired
+ *    pending entry and counts it as a failure
+ *
+ * No background job (pg_cron) required!
+ ******************************************************************************/
+
+/*
+ * Estimate shared memory space needed for pending auth tracking.
+ */
+static Size
+pgpa_memsize(void)
+{
+	Size size;
+
+	size = MAXALIGN(sizeof(pgpaSharedState));
+	size = add_size(size, hash_estimate_size(PGPA_MAX, sizeof(pgpaEntry)));
+
+	return size;
+}
+
+/*
+ * Initialize shared memory for pending auth tracking.
+ */
+static void
+pgpa_shmem_startup(void)
+{
+	bool    found;
+	HASHCTL info;
+
+	pgpa = NULL;
+	pgpa_hash = NULL;
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	pgpa = ShmemInitStruct("pg_pending_auth",
+						   sizeof(pgpaSharedState),
+						   &found);
+
+	if (!found)
+	{
+		pgpa->lock = &(GetNamedLWLockTranche(PGPA_TRANCHE_NAME))->lock;
+		pgpa->num_entries = 0;
+	}
+
+	memset(&info, 0, sizeof(info));
+	info.keysize = sizeof(pgpaHashKey);
+	info.entrysize = sizeof(pgpaEntry);
+	pgpa_hash = ShmemInitHash("pg_pending_auth hash",
+							  PGPA_MAX, PGPA_MAX,
+							  &info,
+							  HASH_ELEM | HASH_BLOBS);
+
+	LWLockRelease(AddinShmemInitLock);
+}
+
+/*
+ * Allocate a new pending auth entry.
+ */
+static pgpaEntry *
+pgpa_entry_alloc(pgpaHashKey *key, const char *username)
+{
+	pgpaEntry  *entry;
+	bool        found;
+
+	if (hash_get_num_entries(pgpa_hash) >= PGPA_MAX)
+	{
+		elog(WARNING, "pending auth cache is full");
+		return NULL;
+	}
+
+	entry = (pgpaEntry *) hash_search(pgpa_hash, key, HASH_ENTER, &found);
+
+	entry->attempt_time = GetCurrentTimestamp();
+	strlcpy(entry->username, username, NAMEDATALEN);
+
+	return entry;
+}
+
+PG_FUNCTION_INFO_V1(pg_auth_attempt_begin);
+
+/*
+ * pg_auth_attempt_begin - Mark the start of an auth attempt.
+ *
+ * Called by user_search() when PgBouncer requests credentials.
+ * Also detects expired pending auth from previous attempts (= failures).
+ *
+ * Returns FALSE if user is banned or doesn't exist, TRUE otherwise.
+ */
+Datum
+pg_auth_attempt_begin(PG_FUNCTION_ARGS)
+{
+	char       *username = PG_GETARG_CSTRING(0);
+	Oid         userOid;
+	pgpaHashKey key;
+	pgpaEntry  *entry;
+	float       current_failures;
+	TimestampTz now = GetCurrentTimestamp();
+	TimestampTz cutoff;
+	bool        had_expired_pending = false;
+
+	/* Safety check */
+	if (!pgpa || !pgpa_hash)
+		PG_RETURN_BOOL(false);
+
+	/* Feature disabled */
+	if (fail_max == 0)
+		PG_RETURN_BOOL(true);
+
+	/* Get user OID */
+	userOid = get_role_oid(username, true);
+	if (userOid == InvalidOid)
+		PG_RETURN_BOOL(false);  /* User doesn't exist */
+
+	/* Check whitelist */
+	if (is_in_whitelist((char *)username, max_auth_whitelist))
+		PG_RETURN_BOOL(true);
+
+	/* Calculate cutoff time */
+	cutoff = now - (PENDING_AUTH_TIMEOUT_SECS * 1000000L);  /* microseconds */
+
+	key.roleid = userOid;
+
+	/*
+	 * STEP 1: Check for expired pending auth (= previous failure)
+	 */
+	LWLockAcquire(pgpa->lock, LW_EXCLUSIVE);
+
+	entry = (pgpaEntry *) hash_search(pgpa_hash, &key, HASH_FIND, NULL);
+
+	if (entry != NULL)
+	{
+		if (entry->attempt_time < cutoff)
+		{
+			/*
+			 * Found expired pending auth!
+			 * This means the previous auth attempt failed.
+			 */
+			elog(DEBUG1, "pg_auth_attempt_begin: found expired pending auth for %s, "
+						"counting as failure", username);
+
+			hash_search(pgpa_hash, &key, HASH_REMOVE, NULL);
+			had_expired_pending = true;
+		}
+		else
+		{
+			/* Recent pending auth - update timestamp */
+			entry->attempt_time = now;
+		}
+	}
+
+	LWLockRelease(pgpa->lock);
+
+	/*
+	 * STEP 2: If we found expired pending, register the failure
+	 */
+	if (had_expired_pending)
+	{
+		pgafHashKey af_key;
+		pgafEntry  *af_entry;
+		float       fail_cnt = 1;
+
+		af_key.roleid = userOid;
+
+		LWLockAcquire(pgaf->lock, LW_EXCLUSIVE);
+
+		af_entry = (pgafEntry *) hash_search(pgaf_hash, &af_key, HASH_FIND, NULL);
+		if (af_entry)
+		{
+			fail_cnt = af_entry->failure_count + 1;
+			hash_search(pgaf_hash, &af_entry->key, HASH_REMOVE, NULL);
+		}
+
+		elog(LOG, "credcheck: auth failure detected for user %s via pgbouncer (count: %d)",
+			 username, (int)fail_cnt);
+
+		pgaf_entry_alloc(&af_key, fail_cnt);
+
+		LWLockRelease(pgaf->lock);
+	}
+
+	/*
+	 * STEP 3: Check if user is now banned
+	 */
+	current_failures = get_auth_failure(username, userOid, 0);
+	if (current_failures >= fail_max)
+	{
+		elog(DEBUG1, "pg_auth_attempt_begin: user %s is banned (failures: %d)",
+			 username, (int)current_failures);
+		PG_RETURN_BOOL(false);
+	}
+
+	/*
+	 * STEP 4: Record new pending auth
+	 */
+	LWLockAcquire(pgpa->lock, LW_EXCLUSIVE);
+
+	entry = (pgpaEntry *) hash_search(pgpa_hash, &key, HASH_FIND, NULL);
+	if (entry == NULL)
+	{
+		pgpa_entry_alloc(&key, username);
+	}
+
+	LWLockRelease(pgpa->lock);
+
+	elog(DEBUG1, "pg_auth_attempt_begin: recorded pending auth for user %s", username);
+
+	PG_RETURN_BOOL(true);
+}
+
+PG_FUNCTION_INFO_V1(pg_auth_attempt_success);
+
+/*
+ * pg_auth_attempt_success - Clear pending auth for successful login.
+ *
+ * Should be called when a user successfully connects to PostgreSQL.
+ * If no username provided, uses current_user.
+ */
+Datum
+pg_auth_attempt_success(PG_FUNCTION_ARGS)
+{
+	char       *username = NULL;
+	Oid         userOid;
+	pgpaHashKey key;
+	bool        found = false;
+
+	/* Safety check */
+	if (!pgpa || !pgpa_hash)
+		PG_RETURN_BOOL(false);
+
+	/* Get username - use current_user if not provided */
+	if (PG_NARGS() > 0 && !PG_ARGISNULL(0))
+	{
+		username = PG_GETARG_CSTRING(0);
+		userOid = get_role_oid(username, true);
+	}
+	else
+	{
+		userOid = GetUserId();
+		username = GetUserNameFromId(userOid, false);
+	}
+
+	if (userOid == InvalidOid)
+		PG_RETURN_BOOL(false);
+
+	key.roleid = userOid;
+
+	/* Remove from pending auth */
+	LWLockAcquire(pgpa->lock, LW_EXCLUSIVE);
+	hash_search(pgpa_hash, &key, HASH_REMOVE, &found);
+	LWLockRelease(pgpa->lock);
+
+	if (found)
+	{
+		elog(DEBUG1, "pg_auth_attempt_success: cleared pending auth for user %s", username);
+		/* Also reset failure count on successful auth */
+		remove_auth_failure(username, userOid);
+	}
+
+	PG_RETURN_BOOL(found);
+}
+
+PG_FUNCTION_INFO_V1(pg_check_user_banned);
+
+/*
+ * pg_check_user_banned - Check if a user is currently banned.
+ *
+ * Lightweight check for use in user_search().
+ */
+Datum
+pg_check_user_banned(PG_FUNCTION_ARGS)
+{
+	char   *username = PG_GETARG_CSTRING(0);
+	Oid     userOid;
+	float   current_failures;
+
+	/* Feature disabled = no one banned */
+	if (fail_max == 0)
+		PG_RETURN_BOOL(false);
+
+	/* Get user OID */
+	userOid = get_role_oid(username, true);
+	if (userOid == InvalidOid)
+		PG_RETURN_BOOL(false);
+
+	/* Check whitelist */
+	if (is_in_whitelist((char *)username, max_auth_whitelist))
+		PG_RETURN_BOOL(false);
+
+	/* Check failure count */
+	current_failures = get_auth_failure(username, userOid, 0);
+
+	PG_RETURN_BOOL(current_failures >= fail_max);
 }
 
