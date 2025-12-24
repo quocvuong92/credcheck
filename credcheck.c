@@ -2943,7 +2943,11 @@ PG_FUNCTION_INFO_V1(pg_auth_attempt_begin);
  * pg_auth_attempt_begin - Mark the start of an auth attempt.
  *
  * Called by user_search() when PgBouncer requests credentials.
- * Also detects expired pending auth from previous attempts (= failures).
+ * 
+ * Logic: If we see a RAPID retry (within PENDING_AUTH_TIMEOUT_SECS), 
+ * it means the previous attempt failed (user is retrying quickly).
+ * If the retry comes AFTER the timeout, assume previous was successful
+ * (user established connection and is now making a new one).
  *
  * Returns FALSE if user is banned or doesn't exist, TRUE otherwise.
  */
@@ -2957,7 +2961,7 @@ pg_auth_attempt_begin(PG_FUNCTION_ARGS)
 	float       current_failures;
 	TimestampTz now = GetCurrentTimestamp();
 	TimestampTz cutoff;
-	bool        had_expired_pending = false;
+	bool        is_rapid_retry = false;
 
 	/* Safety check */
 	if (!pgpa || !pgpa_hash)
@@ -2976,13 +2980,13 @@ pg_auth_attempt_begin(PG_FUNCTION_ARGS)
 	if (is_in_whitelist((char *)username, max_auth_whitelist))
 		PG_RETURN_BOOL(true);
 
-	/* Calculate cutoff time */
+	/* Calculate cutoff time - attempts within this window are "rapid retries" */
 	cutoff = now - (PENDING_AUTH_TIMEOUT_SECS * 1000000L);  /* microseconds */
 
 	key.roleid = userOid;
 
 	/*
-	 * STEP 1: Check for expired pending auth (= previous failure)
+	 * STEP 1: Check if this is a rapid retry (= previous failure)
 	 */
 	LWLockAcquire(pgpa->lock, LW_EXCLUSIVE);
 
@@ -2990,31 +2994,36 @@ pg_auth_attempt_begin(PG_FUNCTION_ARGS)
 
 	if (entry != NULL)
 	{
-		if (entry->attempt_time < cutoff)
+		if (entry->attempt_time >= cutoff)
 		{
 			/*
-			 * Found expired pending auth!
-			 * This means the previous auth attempt failed.
+			 * Found recent pending auth (within timeout window)!
+			 * This is a rapid retry = previous auth attempt failed.
 			 */
-			elog(DEBUG1, "pg_auth_attempt_begin: found expired pending auth for %s, "
+			elog(DEBUG1, "pg_auth_attempt_begin: rapid retry detected for %s, "
 						"counting as failure", username);
-
-			hash_search(pgpa_hash, &key, HASH_REMOVE, NULL);
-			had_expired_pending = true;
+			is_rapid_retry = true;
 		}
 		else
 		{
-			/* Recent pending auth - update timestamp */
-			entry->attempt_time = now;
+			/*
+			 * Previous attempt was long ago (> timeout).
+			 * Assume it was successful - reset failure count.
+			 */
+			elog(DEBUG1, "pg_auth_attempt_begin: previous attempt for %s was > %d sec ago, "
+						"assuming success, resetting failures", username, PENDING_AUTH_TIMEOUT_SECS);
+			remove_auth_failure(username, userOid);
 		}
+		/* Update timestamp for this new attempt */
+		entry->attempt_time = now;
 	}
 
 	LWLockRelease(pgpa->lock);
 
 	/*
-	 * STEP 2: If we found expired pending, register the failure
+	 * STEP 2: If rapid retry, register the failure
 	 */
-	if (had_expired_pending)
+	if (is_rapid_retry)
 	{
 		pgafHashKey af_key;
 		pgafEntry  *af_entry;
