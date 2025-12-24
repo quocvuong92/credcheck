@@ -192,7 +192,7 @@ static HTAB *pgaf_hash = NULL;
  */
 #define PGPA_TRANCHE_NAME  "credcheck_pending_auth"
 #define PGPA_MAX           1024
-#define PENDING_AUTH_TIMEOUT_SECS  5
+#define PENDING_AUTH_TIMEOUT_SECS  1
 
 typedef struct pgpaHashKey
 {
